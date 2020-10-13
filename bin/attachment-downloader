@@ -3,11 +3,67 @@
 import logging
 import os
 import sys
+import email
+import imaplib
+import time
+import re
+import os.path
+import uuid
+import json
+
 from imbox import Imbox
 from getpass import getpass
 from optparse import OptionParser
+from pprint import pprint
 
 from jinja2 import Template
+
+ReplaceString = """
+This message contained an attachment that was stripped out.
+The original type was: %(content_type)s
+The filename was: %(filename)s,
+(and it had additional parameters of:
+%(params)s)
+
+The file was downloaded to: file://%(downloaded_path)s
+"""
+
+def sanitise_size(msg, downloaded_path, imaplib_filename):
+    ct = msg.get_content_type()
+    fn = msg.get_filename()
+    if (msg.get_content_maintype() != 'multipart'):
+        print('hit!')
+        if imaplib_filename == msg.get_filename():
+            print('Removing filename: %s' % msg.get_filename())
+            params = msg.get_params()
+            m_params = []
+            pprint(params)
+            params = params[1:]
+            print("Post 1:")
+            for p in params:
+                m_params.append([p[0], "".join(p[1])])
+
+            pprint(m_params)
+            params = ', '.join([ '='.join(p) for p in m_params ])
+            print("Post Join:")
+            pprint(params)
+            replace = ReplaceString % dict(content_type=ct,
+                                           filename=fn,
+                                           params=params,
+                                           downloaded_path=downloaded_path)
+            msg.set_payload(replace)
+            for k, v in msg.get_params()[1:]:
+                msg.del_param(k)
+            msg.set_type('text/plain')
+            del msg['Content-Transfer-Encoding']
+            del msg['Content-Disposition']
+        else:
+            print('Downloaded filename: %s, doesnt match %s' % (imaplib_filename, msg.get_filename()))
+    else:
+        if msg.is_multipart():
+            payload = [ sanitise_size(x, downloaded_path, imaplib_filename) for x in msg.get_payload() ]
+            msg.set_payload(payload)
+    return msg
 
 if __name__ == '__main__':
 
@@ -43,6 +99,7 @@ if __name__ == '__main__':
                       default="{{ attachment_name }}")
     parser.add_option("--output", dest="download_folder", help="Output directory for attachment download")
     parser.add_option("--delete", dest="delete", action="store_true", help="Delete downloaed E-Mails from Mailbox")
+    parser.add_option("--optimize", dest="optimize", action="store_true", help="Replace attachment with small text-file")
     parser.add_option("--delete-copy-folder", dest="delete_copy_folder", help="IMAP folder to copy emails to before deleting them")
 
     (options, args) = parser.parse_args()
@@ -68,17 +125,31 @@ if __name__ == '__main__':
 
     for (uid, message) in messages:
         mail.mark_seen(uid)
-        logging.info("Processing message '%s' subject '%s'", uid, message.subject)
+        try:
+            email_subject = message.subject
+        except:
+            email_subject = "NoSubject"
+
+        logging.info("Processing message '%s' subject '%s'", uid, email_subject)
+
+        download_counter = 0
+
+        try:
+            striped_message_id = re.sub('[^0-9a-zA-Z_\-]+', '', message.message_id)
+        except:
+            striped_message_id = uuid.uuid4()
+
+        email_message = email.message_from_string(message.raw_email)
 
         for idx, attachment in enumerate(message.attachments):
             try:
                 filename_template = Template(options.filename_template)
+                pprint(attachment)
                 download_filename = filename_template.render(attachment_name=attachment.get('filename'),
-                                                             attachment_idx=idx,
-                                                             subject=message.subject,
-                                                             message_id=message.message_id,
-                                                             local_date=message.date)
-
+                                                            attachment_idx=idx,
+                                                            subject=email_subject,
+                                                            message_id=striped_message_id,
+                                                            local_date=message.date)
                 download_path = os.path.join(options.download_folder, download_filename)
                 os.makedirs(os.path.dirname(os.path.abspath(download_path)), exist_ok=True)
                 logging.info("Downloading attachment '%s' to path %s", attachment.get('filename'), download_path)
@@ -88,18 +159,27 @@ if __name__ == '__main__':
 
                 with open(download_path, "wb") as fp:
                     fp.write(attachment.get('content').read())
+                    download_counter += 1
+
+                    if options.optimize:
+                        logging.info("Trying to remove attachment '%s' from email", attachment.get('filename'))
+                        email_message = sanitise_size(email_message, download_path, attachment.get('imaplib_filename'))
 
             except Exception as e:
                 logging.exception(e)
-                logging.error('Error saving file. Continuing...')
-            else:
-                if options.delete:
-                    if options.delete_copy_folder:
-                        mail.copy(uid, '"' + options.delete_copy_folder + '"')
+                logging.error('Error saving file. Not continuing...')
+                raise(e)
 
-                    mail.delete(uid)
+        if download_counter > 0:
+            if options.optimize:
+                mytime = imaplib.Time2Internaldate(time.time())
+                mail.connection.append(options.imap_folder, '', mytime, email_message.as_string().encode())
 
+            if options.delete:
+                if options.delete_copy_folder:
+                    mail.copy(uid, '"' + options.delete_copy_folder + '"')
 
+                mail.delete(uid)
 
     logging.info('Finished processing messages')
 
@@ -107,4 +187,3 @@ if __name__ == '__main__':
     mail.logout()
 
     logging.info("Done")
-
